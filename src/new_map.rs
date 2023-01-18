@@ -3,7 +3,7 @@ use std::{
     io::{Cursor, Seek, SeekFrom},
 };
 
-use anyhow::Ok;
+use image::{Rgba, RgbaImage};
 
 use crate::buffer_utils;
 
@@ -76,6 +76,7 @@ fn read_header(file: &mut Cursor<Vec<u8>>) -> anyhow::Result<MapHeader> {
 }
 
 /// 读取遮罩数据 (遮罩的图片是被压缩的，需要解压)
+/// 这个方法应该是有问题的
 fn read_mask(file: &mut Cursor<Vec<u8>>) -> anyhow::Result<Vec<Mask>> {
     let unknown = buffer_utils::read_u32(file)?;
     let mask_num = buffer_utils::read_u32(file)?;
@@ -95,92 +96,59 @@ fn read_mask(file: &mut Cursor<Vec<u8>>) -> anyhow::Result<Vec<Mask>> {
         let height = buffer_utils::read_u32(file)?;
         let size = buffer_utils::read_u32(file)?;
         let data = buffer_utils::read_bytes(file, (size) as usize)?;
+
+        let aiginw = ((width >> 2) + if (width % 4 != 0) { 1 } else { 0 }) << 2;
+        let mask_index = (aiginw * height) >> 2;
+
+        let mut decompressed_data = vec![0; mask_index as usize];
+        let out = decompressed_data.as_mut_slice();
+        let out = rust_lzo::LZOContext::decompress_to_slice(data.as_slice(), out);
+
+        if out.1 != rust_lzo::LZOError::OK {
+            return Err(anyhow::anyhow!("Decompress mask data failed"));
+        }
+
+        let mut mask_data: Vec<i64> = vec![0; (width * height) as usize];
+        let mut desc: usize = 0;
+        for k in 0..height {
+            for i in 0..width {
+                let index = (k * aiginw + i) << 1 as usize;
+                let mask = out.0[(index >> 3) as usize];
+                let mask = mask >> (index % 8);
+                if mask & 3 == 3 {
+                    mask_data[desc] = 0xF0;
+                }
+
+                desc += 1;
+            }
+        }
+
+        let mut image = RgbaImage::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let index = y * width + x;
+            let color = mask_data[index as usize];
+            let r = ((color >> 11) & 0x1F) << 3;
+            let g = ((color >> 5) & 0x3F) << 2;
+            let b = (color & 0x1F) << 3;
+            let a = ((color >> 16) & 0x1F) << 3;
+            *pixel = Rgba([r as u8, g as u8, b as u8, a as u8]);
+        }
+
+        image.save(format!("masks/{}.png", offset)).unwrap();
+
         let mask = Mask {
             x,
             y,
             width,
             height,
             size,
-            data,
+            data: out.0.to_vec(),
         };
 
         masks.push(mask);
     }
 
     Ok(masks)
-}
-
-/// 暂时不知道有什么用，从ggelua里面抄来的
-fn jpeg_fix(dst: &mut Vec<u8>, src: &Vec<u8>) -> usize {
-    let mut s = 0;
-    let mut d = 0;
-    let mut dlen = 0;
-    let src_len = src.len();
-
-    while s < src_len && src[s] == 0xFF {
-        dst[d] = 0xFF;
-        d = d + 1;
-        s = s + 1;
-
-        if src[s] == 0xD8 {
-            dst[d] = src[s];
-            d = d + 1;
-            s = s + 1;
-        } else if src[s] == 0xA0 {
-            d = d - 1;
-            s = s + 1;
-        } else if src[s] == 0xC0 || src[s] == 0xC4 || src[s] == 0xDB {
-            dst[d] = src[s];
-            d = d + 1;
-            s = s + 1;
-            let len = (src[s] as i64) << 8 | src[s + 1] as i64;
-            for _ in 1..len {
-                dst[d] = src[s];
-                d = d + 1;
-                s = s + 1
-            }
-        } else if src[s] == 0xDA {
-            dst[d] = 0xDA;
-            d = d + 1;
-            dst[d] = 0x00;
-            d = d + 1;
-            dst[d] = 0x0C;
-            d = d + 1;
-            s = s + 1;
-            let len = ((src[s] as i64) << 8 | src[s + 1] as i64) - 2;
-            s = s + 2;
-            for _ in 1..len {
-                dst[d] = src[s];
-                d = d + 1;
-                s = s + 1;
-            }
-            dst[d] = 0x00;
-            d = d + 1;
-            dst[d] = 0x3F;
-            d = d + 1;
-            dst[d] = 0x00;
-            d = d + 1;
-
-            for _ in 1..src_len - s {
-                if src[s] == 0xFF {
-                    dst[d] = 0xFF;
-                    d = d + 1;
-                    dst[d] = 0x00;
-                    d = d + 1;
-                    s = s + 1;
-                    dlen = dlen + 1;
-                } else {
-                    dst[d] = src[s];
-                    d = d + 1;
-                    s = s + 1;
-                }
-            }
-            dst[d - 2] = 0xD9;
-            break;
-        }
-    }
-
-    dlen + src_len
 }
 
 /// 读取图片并转码
@@ -314,8 +282,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let filename =
-            "C:\\Users\\Tao Mao\\Downloads\\①.数据服务端(7月8日)\\数据服务端\\scene\\1002.map";
+        let filename = "1003.map";
         let mut bytes = load_mapfile(filename).unwrap();
         let header = read_header(&mut bytes).unwrap();
         let masks = read_mask(&mut bytes).unwrap();
@@ -330,6 +297,6 @@ mod tests {
                 imageops::overlay(&mut bk, &unit_image, (j * 320) as i64, (i * 240) as i64);
             }
         }
-        bk.save(format!("{}.jpg", 123)).unwrap();
+        bk.save(format!("{}.jpg", 1003)).unwrap();
     }
 }
